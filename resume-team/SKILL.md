@@ -1,7 +1,9 @@
 ---
-name: restore-team
+name: resume-team
 description: Use this skill when an agent-team session has lost runtime team context — typically after a tmux server crash, a `claude --resume` of the team lead, or any state where SendMessage to teammates fails with "No agent named 'X' is currently addressable. Spawn a new one or use the agent ID." Restores warm-context teammates by `claude --resume`-ing each member's saved session jsonl with the right flags + env, AND rehydrates the team lead's appState.teamContext, AND places the resumed workers into the lead's tmux window in a lead-left/workers-right layout. Triggers on: "restore the team", "rehydrate team", "tmux died bring agents back", "agents lost", "swarm died", "resume my team".
-version: 0.1.0
+compatibility: Requires tmux, claude CLI, and jq. Designed for Claude Code agent-team sessions.
+metadata:
+  version: "0.1.0"
 ---
 
 # Restore an agent team after a runtime context loss
@@ -23,6 +25,7 @@ The fix is bilateral: restore each teammate as a properly-flagged process AND re
 - `jq` available.
 - The team config exists at `~/.claude/teams/<team-name>/config.json`.
 - Each teammate has a saved session jsonl at `~/.claude/projects/<project-id>/<session-id>.jsonl` from before the crash. Without this, warm context is lost — fall back to fresh-spawn-and-brief.
+- **Each `claude --resume` must run with cwd inside the project that owns the session.** `--resume` resolves the session id against the project derived from the current working directory; launching from a subdir of an unrelated project fails with `No conversation found`. Either `cd <project-root>` before invoking, or set the spawn pane's start directory (see step 4).
 
 ## Procedure
 
@@ -81,9 +84,10 @@ For each teammate, split the lead's window and run their `claude --resume` insid
 **Preferred — split-window, then arrange with main-vertical layout:**
 
 ```bash
-# For each teammate, in order:
-tmux split-window -h -t <lead-window> \
-  "env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --resume <session-id> --agent-id <agent-id> --agent-name <name> --team-name <team-name> --agent-color <color>"
+# For each teammate, in order. -c <project-root> sets the pane's cwd so --resume
+# can resolve the session id against the right project.
+tmux split-window -h -c <project-root> -t <lead-window> \
+  "env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --resume <session-id> --agent-id <agent-id> --agent-name <name> --team-name <team-name> --agent-color <color> 'back online; check your inbox and stand by for next task'"
 ```
 
 After all teammates are spawned, apply the layout in one shot:
@@ -107,8 +111,10 @@ After spawning, run `tmux select-layout -t <lead-window> tiled` instead. Each te
 **Critical bits in the spawn command:**
 
 - `env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` — without this, `isAgentSwarmsEnabled()` returns false on the spawned process, the inbox poller never runs, and the teammate appears alive but won't read messages.
+- `tmux split-window -c <project-root>` — sets the new pane's cwd to the project root that owns the session. Without it, the pane inherits the lead's cwd which may be a sibling project, and `--resume` fails with `No conversation found`.
 - `--resume <session-id>` — replays the conversation jsonl for warm context.
 - `--agent-id`, `--agent-name`, `--team-name`, `--agent-color` — set `dynamicTeamContext` on the spawned process so it identifies as a teammate.
+- **Trailing wake prompt** (e.g. `'back online; check your inbox and stand by for next task'`) — current `claude --resume` requires a prompt arg or it exits with `No deferred tool marker found in the resumed session. Provide a prompt to continue the conversation.` The bare `claude --resume <id>` form no longer works.
 
 After spawning, wait ~5-10 seconds for the process to load and the inbox poller to start. Verify by:
 
