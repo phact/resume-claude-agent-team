@@ -83,12 +83,27 @@ For each teammate, split the lead's window and run their `claude --resume` insid
 
 **Preferred — split-window, then arrange with main-vertical layout:**
 
+The resume command must mirror what fresh-spawn passes (see `buildInheritedCliFlags` + `buildInheritedEnvVars` in `src/utils/swarm/spawnUtils.ts`). Missing flags don't fail loudly — messaging still works — but the first time the teammate invokes a real tool (Read/Write/Bash) it crashes inside Ink's reconciler `createInstance` because the permission-prompt component tree renders against an inconsistent `appState.toolPermissionContext`. `--dangerously-skip-permissions` (or matching `--permission-mode`) is the load-bearing fix; the rest prevent secondary breakage (plugin tools missing, wrong API endpoint, broken SendMessage routing back to the lead).
+
 ```bash
 # For each teammate, in order. -c <project-root> sets the pane's cwd so --resume
 # can resolve the session id against the right project.
 tmux split-window -h -c <project-root> -t <lead-window> \
-  "env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 claude --resume <session-id> --agent-id <agent-id> --agent-name <name> --team-name <team-name> --agent-color <color> 'back online; check your inbox and stand by for next task'"
+  "env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+       [forward any of CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
+        ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE CLAUDE_CODE_REMOTE_MEMORY_DIR \
+        HTTPS_PROXY HTTP_PROXY NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS \
+        REQUESTS_CA_BUNDLE CURL_CA_BUNDLE that are set in the lead's env] \
+   claude --resume <session-id> \
+     --agent-id <agent-id> --agent-name <name> --team-name <team-name> --agent-color <color> \
+     --parent-session-id <lead-session-id> \
+     --teammate-mode <mode-from-lead> \
+     --dangerously-skip-permissions \
+     [--settings <path>]  [--plugin-dir <dir>]…  [--model <override>]  [--chrome|--no-chrome] \
+     'back online; check your inbox and stand by for next task'"
 ```
+
+To get the lead's session id for `--parent-session-id`, read it from the most recently modified jsonl in `~/.claude/projects/<project-id>/` whose first user message identifies the lead, or check `/proc/<lead-pid>/cmdline`. The lead's teammate mode lives in `appState` — if the user can't easily read it, default to the same mode used when the team was first spawned (commonly `proactive`).
 
 After all teammates are spawned, apply the layout in one shot:
 
@@ -110,7 +125,12 @@ After spawning, run `tmux select-layout -t <lead-window> tiled` instead. Each te
 
 **Critical bits in the spawn command:**
 
-- `env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` — without this, `isAgentSwarmsEnabled()` returns false on the spawned process, the inbox poller never runs, and the teammate appears alive but won't read messages.
+- `env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` — `CLAUDECODE=1` is the "I am the bundled CLI" marker that gates several runtime paths; the EXPERIMENTAL flag enables `isAgentSwarmsEnabled()` so the inbox poller runs. Without the swarm flag the teammate appears alive but won't read messages.
+- **`--dangerously-skip-permissions` (or matching `--permission-mode`)** — load-bearing for tool use. Fresh-spawn always inherits the lead's permission mode; without it, the resumed teammate falls back to default mode and the permission-prompt UI render crashes Ink's `createInstance` on first Read/Write/Bash. SendMessage doesn't need permission, which is why messaging-only turns appear to work.
+- **`--parent-session-id <lead-session-id>`** — sets `parentSessionId` on the resumed teammate's `dynamicTeamContext`. Used by `SendMessage` to route replies back to the lead. Without it, teammate→lead messages can't find a parent.
+- **`--teammate-mode <mode>`** — propagates the lead's teammate mode (proactive/reactive/etc.). Without it the agent's mode is undefined.
+- **`--settings <path>`** if the lead was started with a settings flag, **`--plugin-dir <dir>`** for each inline plugin, **`--model <override>`** if applicable, **`--chrome`/`--no-chrome`** if explicitly set — these mirror what `buildInheritedCliFlags` always passes during fresh-spawn. Plugin-provided MCP servers in particular won't load on the teammate without `--plugin-dir`, leading to mismatched tool registries.
+- **Forwarded env vars** (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`, proxy + CA cert vars, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_REMOTE`, `CLAUDE_CODE_REMOTE_MEMORY_DIR`) — these don't transit a fresh tmux login shell, so forward them explicitly via `env`. Missing API-provider vars send teammate requests to the wrong endpoint (firstParty default).
 - `tmux split-window -c <project-root>` — sets the new pane's cwd to the project root that owns the session. Without it, the pane inherits the lead's cwd which may be a sibling project, and `--resume` fails with `No conversation found`.
 - `--resume <session-id>` — replays the conversation jsonl for warm context.
 - `--agent-id`, `--agent-name`, `--team-name`, `--agent-color` — set `dynamicTeamContext` on the spawned process so it identifies as a teammate.
@@ -185,6 +205,9 @@ jq '. + [{"from":"team-lead","text":"<your message>","summary":"<short>","timest
 | Pane shows the agent but inbox writes go unread | Missing env var on spawn | Kill pane, respawn with `env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` prefix |
 | `tmux split-window` fails with "no current target" | Lead window was specified imprecisely | Use the full `session:window` form (e.g. `0:0`) — not just `0` |
 | Lead's `SendMessage` still 404s after step 5 | Throwaway spawn didn't fire `setAppState` | Repeat step 5 once. If still broken, lead's session itself may need restart with team flags |
+| Lead's `TaskCreate` still routes to the wrong list / 404s after step 5 | Step 5 rehydrates `appState.teamContext` but `TaskCreate` reads from a different state path (`~/.claude/tasks/<team-name>/`) that the throwaway-spawn doesn't touch | Workaround: write the task JSON directly to `~/.claude/tasks/<team-name>/<id>.json`. The throwaway-spawn fix is SendMessage-only |
+| Resumed teammate processes a few messaging turns then crashes inside `createInstance` (Ink reconciler) on first Read/Write/Bash | Resume command missing `--dangerously-skip-permissions` (or matching `--permission-mode`); permission-prompt UI renders against an inconsistent toolPermissionContext | Kill the pane and respawn with the full fresh-spawn-equivalent flag set listed in step 4 — start with the permission flag, then layer `--plugin-dir` / `--settings` / `--teammate-mode` / `--parent-session-id` |
+| Resumed teammate's tool calls hit unexpected MCP / endpoint errors | Plugin-provided MCP servers didn't load (missing `--plugin-dir`) or API-provider env vars not forwarded | Respawn with `--plugin-dir <dir>` for each inline plugin and forward `ANTHROPIC_BASE_URL` + `CLAUDE_CODE_USE_*` env vars |
 | Pane border shows wrong name (e.g. shows the resumed prompt's name not the flag) | `--agent-name` not honored | Verify CLI flag spelling; if persists, the resumed jsonl may have a hardcoded mismatch — fall back to fresh-spawn |
 | `select-layout main-vertical` makes panes too small | Too many workers | Switch to `tiled` layout, or kill less-relevant workers first |
 | Multiple sessions / panes with the same name | Previous spawn didn't clean up | `tmux kill-session -t <name>` for orphans, or `tmux list-panes -a` and prune by pid |
