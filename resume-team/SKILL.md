@@ -18,6 +18,8 @@ Three failure modes converge on the same symptom — `SendMessage` returns "No a
 
 The fix is bilateral: restore each teammate as a properly-flagged process AND rehydrate the lead's `teamContext` AND place the workers in the lead's tmux window so the user can see them.
 
+**If the lead itself was just resumed (or is about to be):** prefix its `claude --resume` invocation with `CLAUDE_CODE_TASK_LIST_ID=<team-name>` so its `TaskCreate`/`TaskList` tools route to the team's shared task dir instead of falling through to the lead's session-id dir. `leaderTeamName` (the in-memory state that normally fixes this) is set only by `TeamCreateTool` and is not rehydrated by `--resume`. If you forgot and the lead is already running, the symlink fallback in the diagnostics table will work without a restart.
+
 ## Prerequisites
 
 - `tmux` reachable from the calling shell. Verify via `tmux ls` — the user's interactive tmux server must be addressable.
@@ -90,6 +92,7 @@ The resume command must mirror what fresh-spawn passes (see `buildInheritedCliFl
 # can resolve the session id against the right project.
 tmux split-window -h -c <project-root> -t <lead-window> \
   "env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+       CLAUDE_CODE_TASK_LIST_ID=<team-name> \
        [forward any of CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
         ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR CLAUDE_CODE_REMOTE CLAUDE_CODE_REMOTE_MEMORY_DIR \
         HTTPS_PROXY HTTP_PROXY NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS \
@@ -126,6 +129,7 @@ After spawning, run `tmux select-layout -t <lead-window> tiled` instead. Each te
 **Critical bits in the spawn command:**
 
 - `env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` — `CLAUDECODE=1` is the "I am the bundled CLI" marker that gates several runtime paths; the EXPERIMENTAL flag enables `isAgentSwarmsEnabled()` so the inbox poller runs. Without the swarm flag the teammate appears alive but won't read messages.
+- **`CLAUDE_CODE_TASK_LIST_ID=<team-name>`** — short-circuits `getTaskListId()` (priority 1 in `src/utils/tasks.ts:199`) so `TaskCreate`/`TaskList`/`TaskUpdate` write to the team's shared task dir. Without it, the resumed agent falls through to `getSessionId()` and writes to a private `~/.claude/tasks/<session-id>/` that no one else reads. Root cause: `setLeaderTeamName()` (the in-memory variable that normally fixes this for the leader) is only called from `TeamCreateTool`, which never re-fires on `--resume`. The throwaway-spawn rehydrates `appState.teamContext.teamName` but `getTaskListId()` doesn't consult that path.
 - **`--dangerously-skip-permissions` (or matching `--permission-mode`)** — load-bearing for tool use. Fresh-spawn always inherits the lead's permission mode; without it, the resumed teammate falls back to default mode and the permission-prompt UI render crashes Ink's `createInstance` on first Read/Write/Bash. SendMessage doesn't need permission, which is why messaging-only turns appear to work.
 - **`--parent-session-id <lead-session-id>`** — sets `parentSessionId` on the resumed teammate's `dynamicTeamContext`. Used by `SendMessage` to route replies back to the lead. Without it, teammate→lead messages can't find a parent.
 - **`--teammate-mode <mode>`** — propagates the lead's teammate mode (proactive/reactive/etc.). Without it the agent's mode is undefined.
@@ -153,43 +157,74 @@ sleep 3
 jq '[.[] | select(.read==false)] | length' "$inbox"  # should be 0
 ```
 
-### Step 5: Rehydrate the team lead's appState.teamContext
+### Step 5: Rehydrate the team lead's appState.teamContext (use the in-process path)
 
-The lead's `SendMessage` checks `appState.teamContext.teamName` before allowing a send. After `claude --resume`, that's empty. **The fix is to spawn a throwaway agent via the `Agent` tool with the team_name parameter** — the spawn flow's `setAppState` call rehydrates the field as a documented side effect. Verified empirically: a single throwaway spawn restores SendMessage routing for the rest of the lead's session.
+The lead's `appState.teamContext` is empty after `claude --resume` and needs two fields populated:
 
-Use the `Agent` tool from the lead's session:
+- `teamContext.teamName` — gated by `SendMessage` (lead → teammate routing)
+- `teamContext.leadAgentId` — gated by `isTeamLead()`, which is what `useInboxPoller` (`src/hooks/useInboxPoller.ts:81`) checks before reading the lead's inbox. Empty string is falsy → returns false → **lead's inbound inbox poller never starts**, and teammate→lead messages pile up unread.
 
-```
-Agent({
-  subagent_type: "general-purpose",
-  team_name: "<team-name>",
-  name: "rehydrate-throwaway",
-  prompt: "Throwaway agent. Reply with 'ack' and stop. Do nothing else.",
-  run_in_background: true,
-  description: "Rehydrate teamContext"
-})
-```
+There are two spawn code paths and only one of them sets both fields correctly:
 
-This adds a member to the team config under the throwaway name and creates a tmux pane (or in-process worker, depending on backend). Clean up after step 6:
+- **Tmux spawn path** (`src/tools/shared/spawnMultiAgent.ts:458`): `leadAgentId: prev.teamContext?.leadAgentId ?? ''` — falls back to empty string. Running the throwaway twice doesn't help; it always sees `prev.leadAgentId === ''` and re-applies the same fallback. This path fixes `SendMessage` but **does not** start the inbox poller.
+- **In-process spawn path** (`src/tools/shared/spawnMultiAgent.ts:942-984`): synthesizes `leadAgentId` as `formatAgentId(TEAM_LEAD_NAME, teamName)` (= `team-lead@<team-name>`) when missing, and registers a `leadEntry` in the teammates map. This is the path you want.
 
-```bash
-# Remove the throwaway from team config
-jq '.members |= map(select(.name != "rehydrate-throwaway"))' \
-  ~/.claude/teams/<team-name>/config.json > /tmp/clean.json \
-  && mv /tmp/clean.json ~/.claude/teams/<team-name>/config.json
+`handleSpawn` routes between them via `isInProcessEnabled()` (`registry.ts:351`). Inside tmux + auto mode, it returns false → tmux path. To force the in-process path mid-session, flip the teammate-mode setting via `/config` — the `Config.tsx:908` handler calls `clearCliTeammateModeOverride('in-process')`, which updates the runtime snapshot. The poller's `poll` callback (`useInboxPoller.ts:139`) reads `store.getState()` fresh on every 1s tick, so the next tick after `leadAgentId` becomes non-empty picks it up and starts draining the inbox.
 
-# Kill its pane / session if it created one
-tmux kill-session -t rehydrate-throwaway 2>/dev/null
-# (or kill the pane directly if it spawned in the lead's window)
-```
+**Procedure:**
+
+1. From the lead's session, open `/config` and switch **teammate mode** to **`in-process`**.
+
+2. Spawn the throwaway via the `Agent` tool — same shape as before, but it'll now route through `handleSpawnInProcess`:
+
+   ```
+   Agent({
+     subagent_type: "general-purpose",
+     team_name: "<team-name>",
+     name: "rehydrate-throwaway",
+     prompt: "Throwaway agent. Reply with 'ack' and stop. Do nothing else.",
+     run_in_background: true,
+     description: "Rehydrate teamContext + start inbox poller"
+   })
+   ```
+
+3. Verify both directions work (see step 6). Within ~1 second the inbox poller starts; unread teammate→lead messages flush as turns. Existing tmux teammates are unaffected — they poll their own inboxes by name and don't care about the lead's `teamContext.teammates` map.
+
+4. Optional: flip teammate mode back to `auto` / `tmux` via `/config` if you want future spawns to land in tmux panes again. The synthesized `leadAgentId` stays in appState regardless.
+
+5. Cleanup (after step 6 verifies):
+
+   ```bash
+   # Remove the throwaway from team config
+   jq '.members |= map(select(.name != "rehydrate-throwaway"))' \
+     ~/.claude/teams/<team-name>/config.json > /tmp/clean.json \
+     && mv /tmp/clean.json ~/.claude/teams/<team-name>/config.json
+
+   # In-process throwaway has no pane to kill; it's just an entry in
+   # the lead's task list once its "ack and stop" turn completes.
+   ```
+
+**Upstream bug worth filing:** `spawnMultiAgent.ts:458` should mirror the in-process synthesis (one-line change to default `leadAgentId` to `formatAgentId(TEAM_LEAD_NAME, teamName)` when `prev` is empty). That would let the original tmux throwaway-spawn fix both SendMessage and the poller without the teammate-mode dance.
 
 ### Step 6: Verify routing works both directions
 
-**Lead → teammate**: send via `SendMessage` tool to one of the resumed teammates. If it succeeds, the gate passed (= teamContext rehydrated).
+**Lead → teammate**: send via `SendMessage` tool to one of the resumed teammates. If it succeeds, the `teamName` gate passed.
 
-**Teammate → lead**: ask the teammate to reply via SendMessage to "team-lead". If that arrives in the lead's inbox notifications, the round-trip works.
+**Teammate → lead**: ask the teammate to reply via SendMessage to "team-lead". If that arrives in the lead's inbox notifications **as a new turn** (not just appearing in the JSON file), the round-trip works AND the inbox poller is running. The poller surfaces messages as user turns within ~1s of the JSON write.
 
-If `SendMessage` from the lead still returns "currently addressable", the rehydrate step (5) didn't take effect. Try the throwaway spawn again. If it still fails, fall back to direct mailbox writes — the teammate's poller (now running thanks to step 4's env var) will pick them up:
+Quick poller-only check: write a synthetic message into the lead's inbox and see if it gets consumed:
+
+```bash
+inbox=~/.claude/teams/<team-name>/inboxes/team-lead.json
+jq '. + [{"from":"<some-teammate-name>","text":"poller test","summary":"poller test","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'","color":"blue","read":false}]' "$inbox" > /tmp/inbox.json
+mv /tmp/inbox.json "$inbox"
+sleep 2
+jq '[.[] | select(.read==false)] | length' "$inbox"  # should be 0 if poller is running
+```
+
+If unread stays at 1, the poller isn't running — step 5 routed through the tmux path instead of in-process. Re-do step 5 with teammate mode actually flipped to `in-process` first.
+
+If `SendMessage` from the lead still returns "currently addressable", the `teamName` rehydrate didn't take effect either. Try the throwaway spawn again. If it still fails, fall back to direct mailbox writes — the teammate's poller (running thanks to step 4's env var) will pick them up:
 
 ```bash
 jq '. + [{"from":"team-lead","text":"<your message>","summary":"<short>","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'","color":"blue","read":false}]' \
@@ -205,7 +240,8 @@ jq '. + [{"from":"team-lead","text":"<your message>","summary":"<short>","timest
 | Pane shows the agent but inbox writes go unread | Missing env var on spawn | Kill pane, respawn with `env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` prefix |
 | `tmux split-window` fails with "no current target" | Lead window was specified imprecisely | Use the full `session:window` form (e.g. `0:0`) — not just `0` |
 | Lead's `SendMessage` still 404s after step 5 | Throwaway spawn didn't fire `setAppState` | Repeat step 5 once. If still broken, lead's session itself may need restart with team flags |
-| Lead's `TaskCreate` still routes to the wrong list / 404s after step 5 | Step 5 rehydrates `appState.teamContext` but `TaskCreate` reads from a different state path (`~/.claude/tasks/<team-name>/`) that the throwaway-spawn doesn't touch | Workaround: write the task JSON directly to `~/.claude/tasks/<team-name>/<id>.json`. The throwaway-spawn fix is SendMessage-only |
+| Lead receives no notifications when teammates SendMessage; inbox JSON shows `read:false` accumulating | `appState.teamContext.leadAgentId` is `''` after the tmux throwaway-spawn. `useInboxPoller`'s `isTeamLead()` check returns false → poller sleeps. Re-running the throwaway through the tmux path keeps fallback-to-`''` and won't help | Flip teammate mode to `in-process` via `/config` (calls `clearCliTeammateModeOverride` to flush the snapshot), then run the throwaway `Agent({team_name, name, run_in_background: true, ...})`. The in-process spawn synthesizes `leadAgentId = team-lead@<team-name>` and the poller's next 1s tick starts draining the inbox. Existing tmux teammates are unaffected. Revert teammate mode after if desired |
+| Lead's `TaskCreate` still routes to the wrong list / 404s after step 5 | `getTaskListId()` priority chain is env var → teammate context → `getTeamName()` / `leaderTeamName` / `getSessionId()`. `leaderTeamName` is set only by `TeamCreateTool`, never by `--resume`; throwaway-spawn rehydrates `appState.teamContext` but `getTaskListId()` doesn't check it. Lead falls through to `getSessionId()`. | **Preferred (next time):** prefix the lead's `claude --resume` with `CLAUDE_CODE_TASK_LIST_ID=<team-name>`. **For an already-running lead you can't restart:** symlink the session-id task dir to the team task dir — `mv ~/.claude/tasks/<lead-session-id> ~/.claude/tasks/<lead-session-id>.old && ln -s ~/.claude/tasks/<team-name> ~/.claude/tasks/<lead-session-id>`. Reversible (`rm` the symlink, `mv` the .old back). Verified safe: task code uses plain `fs/promises` with no realpath/symlink rejection, the permissions allow-rule (`filesystem.ts:1727`) only checks the `~/.claude/tasks/` prefix, and `proper-lockfile` follows symlinks. **Last resort:** direct JSON writes to `~/.claude/tasks/<team-name>/<id>.json`. |
 | Resumed teammate processes a few messaging turns then crashes inside `createInstance` (Ink reconciler) on first Read/Write/Bash | Resume command missing `--dangerously-skip-permissions` (or matching `--permission-mode`); permission-prompt UI renders against an inconsistent toolPermissionContext | Kill the pane and respawn with the full fresh-spawn-equivalent flag set listed in step 4 — start with the permission flag, then layer `--plugin-dir` / `--settings` / `--teammate-mode` / `--parent-session-id` |
 | Resumed teammate's tool calls hit unexpected MCP / endpoint errors | Plugin-provided MCP servers didn't load (missing `--plugin-dir`) or API-provider env vars not forwarded | Respawn with `--plugin-dir <dir>` for each inline plugin and forward `ANTHROPIC_BASE_URL` + `CLAUDE_CODE_USE_*` env vars |
 | Pane border shows wrong name (e.g. shows the resumed prompt's name not the flag) | `--agent-name` not honored | Verify CLI flag spelling; if persists, the resumed jsonl may have a hardcoded mismatch — fall back to fresh-spawn |
